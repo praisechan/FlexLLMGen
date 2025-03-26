@@ -1,0 +1,2 @@
+gpu_batch_size,prompt_len,percent0,percent1,percent2,percent3,percent4,percent5,cache_size,decode_throughput,total_throughput
+4,4096,100,0,100,0,100,0,3246391296,227.59334159408556,54.62704413679445
