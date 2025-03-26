@@ -1272,6 +1272,51 @@ def run_flexllmgen(args):
         print(log_str)
 
 
+    # save result to csv file
+    import csv
+    import os
+
+    # Specify the CSV file name
+    csv_filename = "results.csv"
+
+    # Check if the file exists and has content
+    file_exists = os.path.isfile(csv_filename) and os.stat(csv_filename).st_size > 0
+
+    # Open the CSV file in append mode
+    with open(csv_filename, "a", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        # Write header if file does not exist or is empty
+        if not file_exists:
+            writer.writerow([
+                "gpu_batch_size",
+                "prompt_len",
+                "percent0",
+                "percent1",
+                "percent2",
+                "percent3",
+                "percent4",
+                "percent5",
+                "cache_size",
+                "decode_throughput",
+                "total_throughput"
+            ])
+        # Append a row with the results
+        writer.writerow([
+            args.gpu_batch_size,
+            args.prompt_len,
+            args.percent[0],
+            args.percent[1],
+            args.percent[2],
+            args.percent[3],
+            args.percent[4],
+            args.percent[5],
+            cache_size,
+            decode_throughput,
+            total_throughput
+        ])
+
+    print(f"Results appended to {csv_filename}")
+
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
         help="The model name.")
