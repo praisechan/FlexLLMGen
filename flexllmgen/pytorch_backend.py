@@ -295,7 +295,7 @@ class TorchDevice:
         v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         return k_cache, v_cache
 
-    def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
+    def mha_old(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
         """Multi-head attention (prefill phase)."""
         # decompress weights
@@ -363,6 +363,89 @@ class TorchDevice:
             v = TorchTensor.create_from_torch(v, self)
 
         return TorchTensor.create_from_torch(value, self), k, v
+
+    def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
+            w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
+        """Multi-head attention (prefill phase) iterating only over the head dimension."""
+        # If weights are compressed, decompress them.
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
+
+        b, s, h = inputs.shape
+        head_dim = h // n_head
+        scaling = head_dim ** -0.5
+
+        # Apply layer normalization.
+        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+
+        # Linear projections for Q, K, V with scaling applied to Q.
+        q_all = F.linear(hidden, w_q.data, bias=b_q.data) * scaling  # shape: (b, s, h)
+        k_all = F.linear(hidden, w_k.data, bias=b_k.data)              # shape: (b, s, h)
+        v_all = F.linear(hidden, w_v.data, bias=b_v.data)              # shape: (b, s, h)
+
+        # Reshape into (b, s, n_head, head_dim).
+        q_all = q_all.view(b, s, n_head, head_dim)
+        k_all = k_all.view(b, s, n_head, head_dim)
+        v_all = v_all.view(b, s, n_head, head_dim)
+
+        # Preallocate output tensor: (b, n_head, s, head_dim).
+        out_heads = torch.empty((b, n_head, s, head_dim), dtype=torch.float16, device=self.dev)
+
+        # Create causal mask: shape (s, s).
+        idx = torch.arange(s, device=self.dev)
+        causal_mask = (idx.unsqueeze(0) <= idx.unsqueeze(1))  # bool tensor, shape (s, s)
+
+        # Combine the provided attention mask with the causal mask.
+        # attention_mask.data is assumed to be a (b, s) boolean tensor.
+        mask = attention_mask.data.unsqueeze(1) & causal_mask.unsqueeze(0)  # (b, s, s)
+
+        # Iterate over heads only.
+        for j in range(n_head):
+            # Extract q, k, v for the j-th head across all batches.
+            q = q_all[:, :, j, :]  # (b, s, head_dim)
+            k = k_all[:, :, j, :]  # (b, s, head_dim)
+            v = v_all[:, :, j, :]  # (b, s, head_dim)
+
+            # Compute attention scores: (b, s, head_dim) x (b, head_dim, s) -> (b, s, s)
+            attn_weights = torch.bmm(q, k.transpose(1, 2))
+
+            # Apply the combined mask.
+            attn_weights = torch.where(mask, attn_weights, torch.full_like(attn_weights, -1e4))
+
+            # Normalize scores with softmax.
+            attn_weights = F.softmax(attn_weights, dim=-1)
+
+            # Compute the weighted sum of values: (b, s, s) x (b, s, head_dim) -> (b, s, head_dim)
+            head_out = torch.bmm(attn_weights, v)
+
+            # Store this head's output.
+            out_heads[:, j, :, :] = head_out
+
+        # Concatenate heads: (b, n_head, s, head_dim) -> (b, s, h).
+        value = out_heads.transpose(1, 2).reshape(b, s, h)
+        value = F.linear(value, w_out.data, bias=b_out.data)
+        value.add_(inputs.data)
+
+        if donate[0]:
+            inputs.delete()
+        if donate[1]:
+            attention_mask.delete()
+
+        # Prepare keys and values for caching.
+        k_cache = k_all.transpose(1, 2).reshape(b * n_head, s, head_dim).transpose(0, 1)
+        v_cache = v_all.transpose(1, 2).reshape(b * n_head, s, head_dim).transpose(0, 1)
+
+        if compress_cache:
+            k_cache = self.compressed_device.compress(k_cache, comp_config)
+            v_cache = self.compressed_device.compress(v_cache, comp_config)
+        else:
+            k_cache = TorchTensor.create_from_torch(k_cache, self)
+            v_cache = TorchTensor.create_from_torch(v_cache, self)
+
+        return TorchTensor.create_from_torch(value, self), k_cache, v_cache
 
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
